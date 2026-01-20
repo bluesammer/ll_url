@@ -25,7 +25,10 @@ URLS = {
     "COMPET_MHL": "https://www.mhlab.ca/",
     "COMPET_SWH": "https://switchhealth.ca/",
     "COMPET_BIO": "https://bio-test.ca/",
-    "COMPET_LL": "https://www.lifelabs.com",
+
+    # Track a less-blocked page than the homepage
+    "COMPET_LL": "https://www.lifelabs.com/news/",
+
     "SOB": "https://www.ontario.ca/page/ohip-schedule-benefits-and-fees",
     "NEWS_1": "https://news.ontario.ca/moh/en",
     "NEWS_2": "https://gov.on.ca",
@@ -33,7 +36,10 @@ URLS = {
     "NEWS_3_2026": "https://www.ontario.ca/document/ohip-infobulletins-2026",
     "NEWS_4": "https://www.regulatoryregistry.gov.on.ca/",
     "NEWS_5": "https://www.ontario.ca/laws/regulation/900552",
-    "NEWS_6": "https://www.ontariohealth.ca/news",
+
+    # Fix: this is the working Ontario Health news URL
+    "NEWS_6": "https://www.ontariohealth.ca/news.html",
+
     "ONT_1": "https://www.ontario.ca/page/ontarios-primary-care-action-plan-1-year-progress-update",
 }
 
@@ -49,7 +55,11 @@ DEFAULT_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Accept": "*/*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
 }
 
 os.makedirs(os.path.dirname(SNAPSHOT_CSV) or ".", exist_ok=True)
@@ -69,34 +79,42 @@ if not ALERT_TO_EMAILS_RAW:
 
 ALERT_TO_EMAILS = [e.strip() for e in ALERT_TO_EMAILS_RAW.split(",") if e.strip()]
 
+
 def send_sendgrid_email(subject, body_text):
+    # Never crash the run because email failed
     if not SENDGRID_API_KEY or not ALERT_FROM_EMAIL or not ALERT_TO_EMAILS:
         print("Email skipped. Missing SendGrid configuration.")
         return False
 
     payload = {
-        "personalizations": [
-            {"to": [{"email": e} for e in ALERT_TO_EMAILS]}
-        ],
+        "personalizations": [{"to": [{"email": e} for e in ALERT_TO_EMAILS]}],
         "from": {"email": ALERT_FROM_EMAIL},
         "subject": subject,
         "content": [{"type": "text/plain", "value": body_text}],
     }
 
-    r = requests.post(
-        "https://api.sendgrid.com/v3/mail/send",
-        headers={
-            "Authorization": f"Bearer {SENDGRID_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=30,
-    )
+    try:
+        r = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
 
-    if r.status_code >= 400:
-        raise RuntimeError(f"SendGrid error {r.status_code}: {r.text[:800]}")
+        if r.status_code >= 400:
+            # Log and continue
+            print(f"SendGrid failed {r.status_code}: {r.text[:800]}")
+            return False
 
-    return True
+        return True
+
+    except Exception as e:
+        print(f"SendGrid exception: {e}")
+        return False
+
 
 def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
     lines = []
@@ -113,25 +131,19 @@ def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
     if not changed.empty:
         lines.append("CHANGED")
         for _, row in changed.iterrows():
-            lines.append(
-                f"- {row['alarm_name']}  changes={row['change_count']}  url={row['url']}"
-            )
+            lines.append(f"- {row['alarm_name']}  changes={row['change_count']}  url={row['url']}")
         lines.append("")
 
     if not errored.empty:
         lines.append("ERROR")
         for _, row in errored.iterrows():
-            lines.append(
-                f"- {row['alarm_name']}  error={row['change_count']}  url={row['url']}"
-            )
+            lines.append(f"- {row['alarm_name']}  error={row['change_count']}  url={row['url']}")
         lines.append("")
 
     if not df_diff_archive_run.empty and not changed.empty:
         lines.append("DIFF EXCERPTS")
         for alarm in changed["alarm_name"].tolist():
-            sub = df_diff_archive_run[
-                df_diff_archive_run["alarm_name"] == alarm
-            ].tail(1)
+            sub = df_diff_archive_run[df_diff_archive_run["alarm_name"] == alarm].tail(1)
             if sub.empty:
                 continue
 
@@ -169,8 +181,9 @@ def build_session():
         backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
+        raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retries)
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
     s.mount("http://", adapter)
     s.mount("https://", adapter)
     return s
@@ -192,6 +205,7 @@ def normalize_content(raw_text):
     soup = BeautifulSoup(raw_text, "html.parser")
     lines = [l.strip() for l in soup.get_text("\n").splitlines() if l.strip()]
     return "\n".join(lines)
+
 
 def diff_to_rows(before, after, max_field_len=4000):
     rows = []
@@ -221,6 +235,30 @@ def diff_to_rows(before, after, max_field_len=4000):
 
     return rows
 
+
+def fetch_text(url):
+    """
+    Primary fetch uses session (with retries).
+    If it hits 403, do a second attempt with extra browser headers.
+    """
+    resp = session.get(url, timeout=TIMEOUT)
+
+    # If retries exhausted, requests may still give a response with 5xx
+    if resp is not None and resp.status_code == 403:
+        fallback_headers = dict(DEFAULT_HEADERS)
+        fallback_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        fallback_headers["Referer"] = "https://www.google.com/"
+        fallback_headers["DNT"] = "1"
+
+        resp = requests.get(url, headers=fallback_headers, timeout=TIMEOUT)
+
+    if resp is None:
+        raise RuntimeError("No response")
+
+    # Raise for non-2xx so you keep your ERROR status behavior
+    resp.raise_for_status()
+    return resp.text
+
 # --------------------------------------
 # DATAFRAMES
 # --------------------------------------
@@ -240,9 +278,8 @@ run_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 for alarm, url in URLS.items():
     try:
-        resp = session.get(url, timeout=TIMEOUT)
-        resp.raise_for_status()
-        current_norm = normalize_content(resp.text)
+        raw_text = fetch_text(url)
+        current_norm = normalize_content(raw_text)
 
         prev_row = df_snapshot[df_snapshot["alarm_name"] == alarm].tail(1)
         prev_text = None
