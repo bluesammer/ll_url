@@ -25,7 +25,7 @@ URLS = {
     "COMPET_MHL": "https://www.mhlab.ca/",
     "COMPET_SWH": "https://switchhealth.ca/",
     "COMPET_BIO": "https://bio-test.ca/",
-     "COMPET_LL": "https://www.lifelabs.com",
+    "COMPET_LL": "https://www.lifelabs.com",
     "SOB": "https://www.ontario.ca/page/ohip-schedule-benefits-and-fees",
     "NEWS_1": "https://news.ontario.ca/moh/en",
     "NEWS_2": "https://gov.on.ca",
@@ -35,9 +35,6 @@ URLS = {
     "NEWS_5": "https://www.ontario.ca/laws/regulation/900552",
     "NEWS_6": "https://www.ontariohealth.ca/news",
     "ONT_1": "https://www.ontario.ca/page/ontarios-primary-care-action-plan-1-year-progress-update",
-
-    
-
 }
 
 SNAPSHOT_CSV = "snapshot_data.csv"
@@ -65,15 +62,22 @@ print(f"Loaded {len(URLS)} URLs")
 
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 ALERT_FROM_EMAIL = os.getenv("ALERT_FROM_EMAIL", "").strip()
-ALERT_TO_EMAIL = os.getenv("ALERT_TO_EMAIL", "").strip()
+
+ALERT_TO_EMAILS_RAW = os.getenv("ALERT_TO_EMAILS", "").strip()
+if not ALERT_TO_EMAILS_RAW:
+    ALERT_TO_EMAILS_RAW = os.getenv("ALERT_TO_EMAIL", "").strip()
+
+ALERT_TO_EMAILS = [e.strip() for e in ALERT_TO_EMAILS_RAW.split(",") if e.strip()]
 
 def send_sendgrid_email(subject, body_text):
-    if not (SENDGRID_API_KEY and ALERT_FROM_EMAIL and ALERT_TO_EMAIL):
-        print("Email skipped. Missing SENDGRID_API_KEY or ALERT_FROM_EMAIL or ALERT_TO_EMAIL")
+    if not SENDGRID_API_KEY or not ALERT_FROM_EMAIL or not ALERT_TO_EMAILS:
+        print("Email skipped. Missing SendGrid configuration.")
         return False
 
     payload = {
-        "personalizations": [{"to": [{"email": ALERT_TO_EMAIL}]}],
+        "personalizations": [
+            {"to": [{"email": e} for e in ALERT_TO_EMAILS]}
+        ],
         "from": {"email": ALERT_FROM_EMAIL},
         "subject": subject,
         "content": [{"type": "text/plain", "value": body_text}],
@@ -109,19 +113,25 @@ def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
     if not changed.empty:
         lines.append("CHANGED")
         for _, row in changed.iterrows():
-            lines.append(f"- {row['alarm_name']}  changes={row['change_count']}  url={row['url']}")
+            lines.append(
+                f"- {row['alarm_name']}  changes={row['change_count']}  url={row['url']}"
+            )
         lines.append("")
 
     if not errored.empty:
         lines.append("ERROR")
         for _, row in errored.iterrows():
-            lines.append(f"- {row['alarm_name']}  error={row['change_count']}  url={row['url']}")
+            lines.append(
+                f"- {row['alarm_name']}  error={row['change_count']}  url={row['url']}"
+            )
         lines.append("")
 
     if not df_diff_archive_run.empty and not changed.empty:
         lines.append("DIFF EXCERPTS")
         for alarm in changed["alarm_name"].tolist():
-            sub = df_diff_archive_run[df_diff_archive_run["alarm_name"] == alarm].tail(1)
+            sub = df_diff_archive_run[
+                df_diff_archive_run["alarm_name"] == alarm
+            ].tail(1)
             if sub.empty:
                 continue
 
@@ -142,6 +152,7 @@ def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
     lines.append(f"- {SUMMARY_CSV}")
     lines.append(f"- {DIFF_ARCHIVE_CSV}")
     lines.append(f"- {SNAPSHOT_CSV}")
+
     return "\n".join(lines)
 
 # --------------------------------------
@@ -174,20 +185,19 @@ def normalize_content(raw_text):
     raw_text = (raw_text or "").strip()
 
     try:
-        parsed = json.loads(raw_text)
-        return parsed
+        return json.loads(raw_text)
     except Exception:
         pass
 
     soup = BeautifulSoup(raw_text, "html.parser")
-    lines = [line.strip() for line in soup.get_text("\n").splitlines() if line.strip()]
+    lines = [l.strip() for l in soup.get_text("\n").splitlines() if l.strip()]
     return "\n".join(lines)
 
 def diff_to_rows(before, after, max_field_len=4000):
+    rows = []
     before_lines = (before or "").splitlines()
     after_lines = (after or "").splitlines()
 
-    rows = []
     line_no = 0
     before_buf = None
 
@@ -201,12 +211,12 @@ def diff_to_rows(before, after, max_field_len=4000):
         elif code == "-":
             before_buf = text
         elif code == "+":
-            b = before_buf if before_buf else ""
-            if len(b) > max_field_len:
-                b = b[:max_field_len] + "...[truncated]"
-            if len(text) > max_field_len:
-                text = text[:max_field_len] + "...[truncated]"
-            rows.append({"line_no": line_no, "before": b, "after": text})
+            b = before_buf or ""
+            rows.append({
+                "line_no": line_no,
+                "before": b[:max_field_len],
+                "after": text[:max_field_len],
+            })
             before_buf = None
 
     return rows
@@ -223,7 +233,7 @@ if os.path.isfile(SNAPSHOT_CSV):
     df_snapshot = pd.read_csv(SNAPSHOT_CSV)
 
 # --------------------------------------
-# MAIN LOOP (ONE RUN_TIME FOR ENTIRE RUN)
+# MAIN LOOP
 # --------------------------------------
 
 run_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -236,121 +246,91 @@ for alarm, url in URLS.items():
 
         prev_row = df_snapshot[df_snapshot["alarm_name"] == alarm].tail(1)
         prev_text = None
-
         if not prev_row.empty:
-            prev_raw = prev_row["content"].values[0]
-            try:
-                prev_text = json.loads(prev_raw)
-            except Exception:
-                prev_text = prev_raw
+            prev_text = prev_row["content"].values[0]
 
         if prev_text is None:
             change_flag = "FIRST_RUN"
             change_count = 0
             changes = []
         else:
-            if isinstance(current_norm, dict):
-                if prev_text != current_norm:
-                    change_flag = "CHANGED"
-                    change_count = 1
-                    changes = [{
-                        "line_no": 0,
-                        "before": json.dumps(prev_text, ensure_ascii=False),
-                        "after": json.dumps(current_norm, ensure_ascii=False)
-                    }]
-                else:
-                    change_flag = "NO_CHANGE"
-                    change_count = 0
-                    changes = []
+            if str(prev_text) != str(current_norm):
+                changes = diff_to_rows(str(prev_text), str(current_norm))
+                change_flag = "CHANGED"
+                change_count = len(changes)
             else:
-                if prev_text != current_norm:
-                    changes = diff_to_rows(str(prev_text), str(current_norm))
-                    change_flag = "CHANGED"
-                    change_count = len(changes)
-                else:
-                    change_flag = "NO_CHANGE"
-                    change_count = 0
-                    changes = []
+                change_flag = "NO_CHANGE"
+                change_count = 0
+                changes = []
 
-        snapshot_row = {
-            "run_time": run_time_str,
-            "alarm_name": alarm,
-            "url": url,
-            "content": json.dumps(current_norm, ensure_ascii=False) if isinstance(current_norm, dict) else str(current_norm),
-        }
-        df_snapshot = pd.concat([df_snapshot, pd.DataFrame([snapshot_row])], ignore_index=True)
-
-        summary_row = {
-            "run_time": run_time_str,
-            "alarm_name": alarm,
-            "url": url,
-            "change_flag": change_flag,
-            "change_count": change_count,
-        }
-        df_summary = pd.concat([df_summary, pd.DataFrame([summary_row])], ignore_index=True)
-
-        if changes:
-            if isinstance(current_norm, dict):
-                before_blob = json.dumps(prev_text, ensure_ascii=False)
-                after_blob = json.dumps(current_norm, ensure_ascii=False)
-                line_no_val = 0
-            else:
-                before_blob = "\n".join([c["before"] for c in changes])[:20000]
-                after_blob = "\n".join([c["after"] for c in changes])[:20000]
-                line_no_val = None
-
-            diff_row = {
+        df_snapshot = pd.concat([
+            df_snapshot,
+            pd.DataFrame([{
                 "run_time": run_time_str,
                 "alarm_name": alarm,
                 "url": url,
-                "line_no": line_no_val,
-                "before": before_blob,
-                "after": after_blob,
-            }
-            df_diff_archive = pd.concat([df_diff_archive, pd.DataFrame([diff_row])], ignore_index=True)
+                "content": str(current_norm),
+            }])
+        ], ignore_index=True)
 
-        print(f"{alarm}: {change_flag} ({change_count} changes)")
+        df_summary = pd.concat([
+            df_summary,
+            pd.DataFrame([{
+                "run_time": run_time_str,
+                "alarm_name": alarm,
+                "url": url,
+                "change_flag": change_flag,
+                "change_count": change_count,
+            }])
+        ], ignore_index=True)
+
+        if changes:
+            df_diff_archive = pd.concat([
+                df_diff_archive,
+                pd.DataFrame([{
+                    "run_time": run_time_str,
+                    "alarm_name": alarm,
+                    "url": url,
+                    "line_no": None,
+                    "before": "\n".join(c["before"] for c in changes),
+                    "after": "\n".join(c["after"] for c in changes),
+                }])
+            ], ignore_index=True)
+
+        print(f"{alarm}: {change_flag} ({change_count})")
 
     except Exception as e:
-        summary_row = {
-            "run_time": run_time_str,
-            "alarm_name": alarm,
-            "url": url,
-            "change_flag": "ERROR",
-            "change_count": str(e),
-        }
-        df_summary = pd.concat([df_summary, pd.DataFrame([summary_row])], ignore_index=True)
-        print(f"{alarm}: ERROR - {e}")
+        df_summary = pd.concat([
+            df_summary,
+            pd.DataFrame([{
+                "run_time": run_time_str,
+                "alarm_name": alarm,
+                "url": url,
+                "change_flag": "ERROR",
+                "change_count": str(e),
+            }])
+        ], ignore_index=True)
+        print(f"{alarm}: ERROR {e}")
 
 # --------------------------------------
-# SAVE CSVs
+# SAVE FILES
 # --------------------------------------
 
 df_snapshot.to_csv(SNAPSHOT_CSV, index=False)
 df_summary.to_csv(SUMMARY_CSV, index=False)
 df_diff_archive.to_csv(DIFF_ARCHIVE_CSV, index=False)
 
-print("\n=== DIFF ARCHIVE (tail) ===")
-print(df_diff_archive.tail())
-
 # --------------------------------------
-# SEND ONE EMAIL IF ANYTHING CHANGED OR ERRORED
+# SEND EMAIL
 # --------------------------------------
 
 df_summary_run = df_summary[df_summary["run_time"] == run_time_str]
 df_diff_archive_run = df_diff_archive[df_diff_archive["run_time"] == run_time_str]
 
-send_email = (df_summary_run["change_flag"] == "CHANGED").any() or (df_summary_run["change_flag"] == "ERROR").any()
-
-if send_email:
+if (df_summary_run["change_flag"] == "CHANGED").any() or (df_summary_run["change_flag"] == "ERROR").any():
     subject = f"URL Monitor Alert {run_time_str}"
     body = build_email_body(df_summary_run, df_diff_archive_run, run_time_str)
-    try:
-        ok = send_sendgrid_email(subject, body)
-        if ok:
-            print("Email sent")
-    except Exception as e:
-        print(f"Email failed: {e}")
+    send_sendgrid_email(subject, body)
 else:
     print("No changes, no email")
 
