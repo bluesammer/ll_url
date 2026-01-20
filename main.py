@@ -25,10 +25,7 @@ URLS = {
     "COMPET_MHL": "https://www.mhlab.ca/",
     "COMPET_SWH": "https://switchhealth.ca/",
     "COMPET_BIO": "https://bio-test.ca/",
-
-    # Track a less-blocked page than the homepage
     "COMPET_LL": "https://www.lifelabs.com/",
-
     "SOB": "https://www.ontario.ca/page/ohip-schedule-benefits-and-fees",
     "NEWS_1": "https://news.ontario.ca/moh/en",
     "NEWS_2": "https://gov.on.ca",
@@ -36,10 +33,7 @@ URLS = {
     "NEWS_3_2026": "https://www.ontario.ca/document/ohip-infobulletins-2026",
     "NEWS_4": "https://www.regulatoryregistry.gov.on.ca/",
     "NEWS_5": "https://www.ontario.ca/laws/regulation/900552",
-
-    # Fix: this is the working Ontario Health news URL
     "NEWS_6": "https://www.ontariohealth.ca/news.html",
-
     "ONT_1": "https://www.ontario.ca/page/ontarios-primary-care-action-plan-1-year-progress-update",
 }
 
@@ -65,6 +59,24 @@ DEFAULT_HEADERS = {
 os.makedirs(os.path.dirname(SNAPSHOT_CSV) or ".", exist_ok=True)
 
 print(f"Loaded {len(URLS)} URLs")
+
+# --------------------------------------
+# URL GUARD (prevents urldefense / sendgrid tracking links)
+# --------------------------------------
+
+def validate_urls(urls: dict):
+    bad = []
+    for name, url in urls.items():
+        u = (url or "").lower()
+        if "urldefense.com" in u or "ct.sendgrid.net/ls/click" in u:
+            bad.append((name, url))
+    if bad:
+        print("BAD URLS FOUND. Replace with the real website URLs:")
+        for name, url in bad:
+            print(" -", name, url)
+        raise SystemExit(2)
+
+validate_urls(URLS)
 
 # --------------------------------------
 # EMAIL ALERTS (SendGrid)
@@ -105,10 +117,10 @@ def send_sendgrid_email(subject, body_text):
         )
 
         if r.status_code >= 400:
-            # Log and continue
             print(f"SendGrid failed {r.status_code}: {r.text[:800]}")
             return False
 
+        print("SendGrid sent ok:", subject)
         return True
 
     except Exception as e:
@@ -236,26 +248,23 @@ def diff_to_rows(before, after, max_field_len=4000):
     return rows
 
 
+def jina_url(url: str) -> str:
+    return "https://r.jina.ai/" + url
+
+
 def fetch_text(url):
-    """
-    Primary fetch uses session (with retries).
-    If it hits 403, do a second attempt with extra browser headers.
-    """
     resp = session.get(url, timeout=TIMEOUT)
-
-    # If retries exhausted, requests may still give a response with 5xx
-    if resp is not None and resp.status_code == 403:
-        fallback_headers = dict(DEFAULT_HEADERS)
-        fallback_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        fallback_headers["Referer"] = "https://www.google.com/"
-        fallback_headers["DNT"] = "1"
-
-        resp = requests.get(url, headers=fallback_headers, timeout=TIMEOUT)
 
     if resp is None:
         raise RuntimeError("No response")
 
-    # Raise for non-2xx so you keep your ERROR status behavior
+    # WAF 403 fallback for cloud IPs
+    if resp.status_code == 403:
+        print("403 fallback via jina:", url)
+        jr = requests.get(jina_url(url), headers=DEFAULT_HEADERS, timeout=TIMEOUT)
+        jr.raise_for_status()
+        return jr.text
+
     resp.raise_for_status()
     return resp.text
 
