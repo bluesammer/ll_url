@@ -30,6 +30,7 @@ URLS = {
     "NEWS_1": "https://news.ontario.ca/moh/en",
     "NEWS_2": "https://gov.on.ca",
     "NEWS_3": "https://www.ontario.ca/document/ohip-infobulletins-2025",
+    "NEWS_3_2026": "https://www.ontario.ca/document/ohip-infobulletins-2026",
     "NEWS_4": "https://www.regulatoryregistry.gov.on.ca/",
     "NEWS_5": "https://www.ontario.ca/laws/regulation/900552",
     "NEWS_6": "https://www.ontariohealth.ca/news",
