@@ -27,7 +27,7 @@ URLS = {
     "COMPET_BIO": "https://bio-test.ca/",
 
     # Track a less-blocked page than the homepage
-    "COMPET_LL": "https://www.lifelabs.com/news/",
+    "COMPET_LL": "https://www.lifelabs.com/",
 
     "SOB": "https://www.ontario.ca/page/ohip-schedule-benefits-and-fees",
     "NEWS_1": "https://news.ontario.ca/moh/en",
