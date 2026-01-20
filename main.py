@@ -33,6 +33,10 @@ URLS = {
     "NEWS_4": "https://www.regulatoryregistry.gov.on.ca/",
     "NEWS_5": "https://www.ontario.ca/laws/regulation/900552",
     "NEWS_6": "https://www.ontariohealth.ca/news",
+    "ONT_1": "https://www.ontario.ca/page/ontarios-primary-care-action-plan-1-year-progress-update",
+
+    
+
 }
 
 SNAPSHOT_CSV = "snapshot_data.csv"
