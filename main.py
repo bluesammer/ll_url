@@ -93,7 +93,6 @@ ALERT_TO_EMAILS = [e.strip() for e in ALERT_TO_EMAILS_RAW.split(",") if e.strip(
 
 
 def send_sendgrid_email(subject, body_text):
-    # Never crash the run because email failed
     if not SENDGRID_API_KEY or not ALERT_FROM_EMAIL or not ALERT_TO_EMAILS:
         print("Email skipped. Missing SendGrid configuration.")
         return False
@@ -128,6 +127,11 @@ def send_sendgrid_email(subject, body_text):
         return False
 
 
+def safe_url(u: str) -> str:
+    u = str(u or "")
+    return u.replace("https://", "hxxps://").replace("http://", "hxxp://")
+
+
 def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
     lines = []
     lines.append(f"Run time: {run_time_str}")
@@ -143,13 +147,17 @@ def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
     if not changed.empty:
         lines.append("CHANGED")
         for _, row in changed.iterrows():
-            lines.append(f"- {row['alarm_name']}  changes={row['change_count']}  url={row['url']}")
+            lines.append(
+                f"- {row['alarm_name']}  changes={row['change_count']}  url={safe_url(row['url'])}"
+            )
         lines.append("")
 
     if not errored.empty:
         lines.append("ERROR")
         for _, row in errored.iterrows():
-            lines.append(f"- {row['alarm_name']}  error={row['change_count']}  url={row['url']}")
+            lines.append(
+                f"- {row['alarm_name']}  error={row['change_count']}  url={safe_url(row['url'])}"
+            )
         lines.append("")
 
     if not df_diff_archive_run.empty and not changed.empty:
@@ -248,8 +256,8 @@ def diff_to_rows(before, after, max_field_len=4000):
     return rows
 
 
-def jina_url(url: str) -> str:
-    return "https://r.jina.ai/" + url
+def archive_url(url: str) -> str:
+    return "https://web.archive.org/web/0/" + url
 
 
 def fetch_text(url):
@@ -258,12 +266,11 @@ def fetch_text(url):
     if resp is None:
         raise RuntimeError("No response")
 
-    # WAF 403 fallback for cloud IPs
     if resp.status_code == 403:
-        print("403 fallback via jina:", url)
-        jr = requests.get(jina_url(url), headers=DEFAULT_HEADERS, timeout=TIMEOUT)
-        jr.raise_for_status()
-        return jr.text
+        print("403 blocked. Trying archive:", url)
+        ar = requests.get(archive_url(url), headers=DEFAULT_HEADERS, timeout=TIMEOUT)
+        ar.raise_for_status()
+        return ar.text
 
     resp.raise_for_status()
     return resp.text
@@ -309,53 +316,65 @@ for alarm, url in URLS.items():
                 change_count = 0
                 changes = []
 
-        df_snapshot = pd.concat([
-            df_snapshot,
-            pd.DataFrame([{
-                "run_time": run_time_str,
-                "alarm_name": alarm,
-                "url": url,
-                "content": str(current_norm),
-            }])
-        ], ignore_index=True)
-
-        df_summary = pd.concat([
-            df_summary,
-            pd.DataFrame([{
-                "run_time": run_time_str,
-                "alarm_name": alarm,
-                "url": url,
-                "change_flag": change_flag,
-                "change_count": change_count,
-            }])
-        ], ignore_index=True)
-
-        if changes:
-            df_diff_archive = pd.concat([
-                df_diff_archive,
+        df_snapshot = pd.concat(
+            [
+                df_snapshot,
                 pd.DataFrame([{
                     "run_time": run_time_str,
                     "alarm_name": alarm,
                     "url": url,
-                    "line_no": None,
-                    "before": "\n".join(c["before"] for c in changes),
-                    "after": "\n".join(c["after"] for c in changes),
-                }])
-            ], ignore_index=True)
+                    "content": str(current_norm),
+                }]),
+            ],
+            ignore_index=True,
+        )
+
+        df_summary = pd.concat(
+            [
+                df_summary,
+                pd.DataFrame([{
+                    "run_time": run_time_str,
+                    "alarm_name": alarm,
+                    "url": url,
+                    "change_flag": change_flag,
+                    "change_count": change_count,
+                }]),
+            ],
+            ignore_index=True,
+        )
+
+        if changes:
+            df_diff_archive = pd.concat(
+                [
+                    df_diff_archive,
+                    pd.DataFrame([{
+                        "run_time": run_time_str,
+                        "alarm_name": alarm,
+                        "url": url,
+                        "line_no": None,
+                        "before": "\n".join(c["before"] for c in changes),
+                        "after": "\n".join(c["after"] for c in changes),
+                    }]),
+                ],
+                ignore_index=True,
+            )
 
         print(f"{alarm}: {change_flag} ({change_count})")
 
     except Exception as e:
-        df_summary = pd.concat([
-            df_summary,
-            pd.DataFrame([{
-                "run_time": run_time_str,
-                "alarm_name": alarm,
-                "url": url,
-                "change_flag": "ERROR",
-                "change_count": str(e),
-            }])
-        ], ignore_index=True)
+        df_summary = pd.concat(
+            [
+                df_summary,
+                pd.DataFrame([{
+                    "run_time": run_time_str,
+                    "alarm_name": alarm,
+                    "url": url,
+                    "change_flag": "ERROR",
+                    "change_count": str(e),
+                }]),
+            ],
+            ignore_index=True,
+        )
         print(f"{alarm}: ERROR {e}")
 
 # --------------------------------------
