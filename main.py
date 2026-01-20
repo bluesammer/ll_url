@@ -25,7 +25,7 @@ URLS = {
     "COMPET_MHL": "https://www.mhlab.ca/",
     "COMPET_SWH": "https://switchhealth.ca/",
     "COMPET_BIO": "https://bio-test.ca/",
-    "COMPET_LL": "https://www.lifelabs.com/",
+    #"COMPET_LL": "https://www.lifelabs.com/",
     "SOB": "https://www.ontario.ca/page/ohip-schedule-benefits-and-fees",
     "NEWS_1": "https://news.ontario.ca/moh/en",
     "NEWS_2": "https://gov.on.ca",
@@ -33,7 +33,7 @@ URLS = {
     "NEWS_3_2026": "https://www.ontario.ca/document/ohip-infobulletins-2026",
     "NEWS_4": "https://www.regulatoryregistry.gov.on.ca/",
     "NEWS_5": "https://www.ontario.ca/laws/regulation/900552",
-    "NEWS_6": "https://www.ontariohealth.ca/news.html",
+   # "NEWS_6": "https://www.ontariohealth.ca/news.html",
     "ONT_1": "https://www.ontario.ca/page/ontarios-primary-care-action-plan-1-year-progress-update",
 }
 
