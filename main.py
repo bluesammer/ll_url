@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
+# In[3]:
 
 
 import os
@@ -25,7 +25,7 @@ URLS = {
     "COMPET_MHL": "https://www.mhlab.ca/",
     "COMPET_SWH": "https://switchhealth.ca/",
     "COMPET_BIO": "https://bio-test.ca/",
-    #"COMPET_LL": "https://www.lifelabs.com/",
+    # "COMPET_LL": "https://www.lifelabs.com/",
     "SOB": "https://www.ontario.ca/page/ohip-schedule-benefits-and-fees",
     "NEWS_1": "https://news.ontario.ca/moh/en",
     "NEWS_2": "https://gov.on.ca",
@@ -33,7 +33,7 @@ URLS = {
     "NEWS_3_2026": "https://www.ontario.ca/document/ohip-infobulletins-2026",
     "NEWS_4": "https://www.regulatoryregistry.gov.on.ca/",
     "NEWS_5": "https://www.ontario.ca/laws/regulation/900552",
-   # "NEWS_6": "https://www.ontariohealth.ca/news.html",
+    # "NEWS_6": "https://www.ontariohealth.ca/news.html",
     "ONT_1": "https://www.ontario.ca/page/ontarios-primary-care-action-plan-1-year-progress-update",
 }
 
@@ -79,6 +79,81 @@ def validate_urls(urls: dict):
 validate_urls(URLS)
 
 # --------------------------------------
+# DISCORD ALERTS (Webhook)
+# --------------------------------------
+
+# Set this in Railway (or your env):
+# DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/....
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+#DISCORD_WEBHOOK_URL = os.getenv("https://discord.com/api/webhooks/1463375488851378403/vnqZ8AVDmGT_6jz8Q9-yAyxWjjPIv3KcLEyfhZn6gQt0NcvxrnmvYqVMNz5VmNRcNP7b", "").strip()
+
+def send_discord_webhook(message: str) -> bool:
+    if not DISCORD_WEBHOOK_URL:
+        print("Discord skipped. Missing DISCORD_WEBHOOK_URL.")
+        return False
+
+    payload = {"content": message[:1900]}  # keep under Discord limits
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+        if r.status_code >= 400:
+            print(f"Discord failed {r.status_code}: {r.text[:800]}")
+            return False
+        print("Discord sent ok")
+        return True
+    except Exception as e:
+        print(f"Discord exception: {e}")
+        return False
+
+
+def safe_url(u: str) -> str:
+    u = str(u or "")
+    return u.replace("https://", "hxxps://").replace("http://", "hxxp://")
+
+
+def build_discord_message(df_summary_run, df_diff_archive_run, run_time_str):
+    changed = df_summary_run[df_summary_run["change_flag"] == "CHANGED"]
+    errored = df_summary_run[df_summary_run["change_flag"] == "ERROR"]
+
+    lines = []
+    lines.append(f"URL Monitor Alert {run_time_str}")
+    lines.append(f"Changed: {len(changed)} | Errors: {len(errored)}")
+    lines.append("")
+
+    if len(changed) > 0:
+        lines.append("CHANGED")
+        for _, row in changed.iterrows():
+            lines.append(
+                f"- {row['alarm_name']} changes={row['change_count']} url={safe_url(row['url'])}"
+            )
+        lines.append("")
+
+    if len(errored) > 0:
+        lines.append("ERROR")
+        for _, row in errored.iterrows():
+            lines.append(
+                f"- {row['alarm_name']} error={row['change_count']} url={safe_url(row['url'])}"
+            )
+        lines.append("")
+
+    # Optional: include 1 diff excerpt per changed alarm, trimmed
+    if (len(changed) > 0) and (len(df_diff_archive_run) > 0):
+        lines.append("DIFF EXCERPTS (trimmed)")
+        for alarm in changed["alarm_name"].tolist():
+            sub = df_diff_archive_run[df_diff_archive_run["alarm_name"] == alarm].tail(1)
+            if sub.empty:
+                continue
+            before_txt = str(sub["before"].values[0])[:600]
+            after_txt = str(sub["after"].values[0])[:600]
+            lines.append(f"Alarm: {alarm}")
+            lines.append("Before:")
+            lines.append(before_txt)
+            lines.append("After:")
+            lines.append(after_txt)
+            lines.append("")
+
+    return "\n".join(lines)
+
+# --------------------------------------
 # EMAIL ALERTS (SendGrid)
 # --------------------------------------
 
@@ -90,7 +165,6 @@ if not ALERT_TO_EMAILS_RAW:
     ALERT_TO_EMAILS_RAW = os.getenv("ALERT_TO_EMAIL", "").strip()
 
 ALERT_TO_EMAILS = [e.strip() for e in ALERT_TO_EMAILS_RAW.split(",") if e.strip()]
-
 
 def send_sendgrid_email(subject, body_text):
     if not SENDGRID_API_KEY or not ALERT_FROM_EMAIL or not ALERT_TO_EMAILS:
@@ -125,11 +199,6 @@ def send_sendgrid_email(subject, body_text):
     except Exception as e:
         print(f"SendGrid exception: {e}")
         return False
-
-
-def safe_url(u: str) -> str:
-    u = str(u or "")
-    return u.replace("https://", "hxxps://").replace("http://", "hxxp://")
 
 
 def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
@@ -386,16 +455,25 @@ df_summary.to_csv(SUMMARY_CSV, index=False)
 df_diff_archive.to_csv(DIFF_ARCHIVE_CSV, index=False)
 
 # --------------------------------------
-# SEND EMAIL
+# SEND ALERTS (Email + Discord)
 # --------------------------------------
 
 df_summary_run = df_summary[df_summary["run_time"] == run_time_str]
 df_diff_archive_run = df_diff_archive[df_diff_archive["run_time"] == run_time_str]
 
-if (df_summary_run["change_flag"] == "CHANGED").any() or (df_summary_run["change_flag"] == "ERROR").any():
+has_changed = (df_summary_run["change_flag"] == "CHANGED").any()
+has_error = (df_summary_run["change_flag"] == "ERROR").any()
+
+if has_changed or has_error:
     subject = f"URL Monitor Alert {run_time_str}"
+
+    # Email
     body = build_email_body(df_summary_run, df_diff_archive_run, run_time_str)
     send_sendgrid_email(subject, body)
+
+    # Discord
+    discord_msg = build_discord_message(df_summary_run, df_diff_archive_run, run_time_str)
+    send_discord_webhook(discord_msg)
 else:
-    print("No changes, no email")
+    print("No changes, no alerts")
 
