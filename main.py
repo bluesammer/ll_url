@@ -20,7 +20,7 @@ import pandas as pd
 
 URLS = {
     "COMPET_DYC": "https://www.dynacare.ca/",
-    "COMPET_AHL": "https://alphalabs.ca/",
+    # "COMPET_AHL": "https://alphalabs.ca/",
     "COMPET_MOW": "https://medlabsofwindsor.com/",
     "COMPET_MHL": "https://www.mhlab.ca/",
     "COMPET_SWH": "https://switchhealth.ca/",
@@ -33,8 +33,7 @@ URLS = {
     "NEWS_3_2026": "https://www.ontario.ca/document/ohip-infobulletins-2026",
     "NEWS_4": "https://www.regulatoryregistry.gov.on.ca/",
     "NEWS_5": "https://www.ontario.ca/laws/regulation/900552",
-    # "NEWS_6": "https://www.ontariohealth.ca/news.html",
-    "ONT_1": "https://www.ontario.ca/page/ontarios-primary-care-action-plan-1-year-progress-update",
+    "NEWS_6": "https://www.ontario.ca/page/ontarios-primary-care-action-plan-1-year-progress-update",
 }
 
 SNAPSHOT_CSV = "snapshot_data.csv"
@@ -61,7 +60,7 @@ os.makedirs(os.path.dirname(SNAPSHOT_CSV) or ".", exist_ok=True)
 print(f"Loaded {len(URLS)} URLs")
 
 # --------------------------------------
-# URL GUARD (prevents urldefense / sendgrid tracking links)
+# URL GUARD
 # --------------------------------------
 
 def validate_urls(urls: dict):
@@ -79,78 +78,58 @@ def validate_urls(urls: dict):
 validate_urls(URLS)
 
 # --------------------------------------
-# DISCORD ALERTS (Webhook)
+# DISCORD ALERTS (3 channels via 3 webhooks)
 # --------------------------------------
 
-# Set this in Railway (or your env):
-# DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/....
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-#DISCORD_WEBHOOK_URL = os.getenv("https://discord.com/api/webhooks/1463375488851378403/vnqZ8AVDmGT_6jz8Q9-yAyxWjjPIv3KcLEyfhZn6gQt0NcvxrnmvYqVMNz5VmNRcNP7b", "").strip()
+DISCORD_WEBHOOK_URL_ALL = os.getenv("DISCORD_WEBHOOK_URL_ALL", "").strip()
+DISCORD_WEBHOOK_URL_CHANGED = os.getenv("DISCORD_WEBHOOK_URL_CHANGED", "").strip()
+DISCORD_WEBHOOK_URL_ERROR = os.getenv("DISCORD_WEBHOOK_URL_ERROR", "").strip()
 
-def send_discord_webhook(message: str) -> bool:
-    if not DISCORD_WEBHOOK_URL:
-        print("Discord skipped. Missing DISCORD_WEBHOOK_URL.")
+def send_discord_webhook(webhook_url: str, message: str) -> bool:
+    if not webhook_url:
+        print("Discord skipped. Webhook missing.")
         return False
 
-    payload = {"content": message[:1900]}  # keep under Discord limits
+    payload = {"content": message[:1900]}
     try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+        r = requests.post(webhook_url, json=payload, timeout=30)
+        print("Discord status:", r.status_code)
         if r.status_code >= 400:
-            print(f"Discord failed {r.status_code}: {r.text[:800]}")
+            print("Discord failed:", r.text[:800])
             return False
         print("Discord sent ok")
         return True
     except Exception as e:
-        print(f"Discord exception: {e}")
+        print("Discord exception:", e)
         return False
-
 
 def safe_url(u: str) -> str:
     u = str(u or "")
     return u.replace("https://", "hxxps://").replace("http://", "hxxp://")
 
-
-def build_discord_message(df_summary_run, df_diff_archive_run, run_time_str):
+def build_discord_all_message(df_summary_run, run_time_str):
     changed = df_summary_run[df_summary_run["change_flag"] == "CHANGED"]
     errored = df_summary_run[df_summary_run["change_flag"] == "ERROR"]
+    nochange = df_summary_run[df_summary_run["change_flag"] == "NO_CHANGE"]
+    first = df_summary_run[df_summary_run["change_flag"] == "FIRST_RUN"]
 
     lines = []
-    lines.append(f"URL Monitor Alert {run_time_str}")
-    lines.append(f"Changed: {len(changed)} | Errors: {len(errored)}")
-    lines.append("")
+    lines.append(f"RUN {run_time_str}")
+    lines.append(f"Changed {len(changed)} | Errors {len(errored)} | No change {len(nochange)} | First {len(first)}")
+    return "\n".join(lines)
 
-    if len(changed) > 0:
-        lines.append("CHANGED")
-        for _, row in changed.iterrows():
-            lines.append(
-                f"- {row['alarm_name']} changes={row['change_count']} url={safe_url(row['url'])}"
-            )
-        lines.append("")
+def build_discord_changed_message(df_summary_run, run_time_str):
+    changed = df_summary_run[df_summary_run["change_flag"] == "CHANGED"]
+    lines = [f"CHANGED {run_time_str}", ""]
+    for _, row in changed.iterrows():
+        lines.append(f"- {row['alarm_name']} changes={row['change_count']} url={safe_url(row['url'])}")
+    return "\n".join(lines)
 
-    if len(errored) > 0:
-        lines.append("ERROR")
-        for _, row in errored.iterrows():
-            lines.append(
-                f"- {row['alarm_name']} error={row['change_count']} url={safe_url(row['url'])}"
-            )
-        lines.append("")
-
-    # Optional: include 1 diff excerpt per changed alarm, trimmed
-    if (len(changed) > 0) and (len(df_diff_archive_run) > 0):
-        lines.append("DIFF EXCERPTS (trimmed)")
-        for alarm in changed["alarm_name"].tolist():
-            sub = df_diff_archive_run[df_diff_archive_run["alarm_name"] == alarm].tail(1)
-            if sub.empty:
-                continue
-            before_txt = str(sub["before"].values[0])[:600]
-            after_txt = str(sub["after"].values[0])[:600]
-            lines.append(f"Alarm: {alarm}")
-            lines.append("Before:")
-            lines.append(before_txt)
-            lines.append("After:")
-            lines.append(after_txt)
-            lines.append("")
-
+def build_discord_error_message(df_summary_run, run_time_str):
+    errored = df_summary_run[df_summary_run["change_flag"] == "ERROR"]
+    lines = [f"ERROR {run_time_str}", ""]
+    for _, row in errored.iterrows():
+        lines.append(f"- {row['alarm_name']} error={row['change_count']} url={safe_url(row['url'])}")
     return "\n".join(lines)
 
 # --------------------------------------
@@ -200,7 +179,6 @@ def send_sendgrid_email(subject, body_text):
         print(f"SendGrid exception: {e}")
         return False
 
-
 def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
     lines = []
     lines.append(f"Run time: {run_time_str}")
@@ -216,17 +194,13 @@ def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
     if not changed.empty:
         lines.append("CHANGED")
         for _, row in changed.iterrows():
-            lines.append(
-                f"- {row['alarm_name']}  changes={row['change_count']}  url={safe_url(row['url'])}"
-            )
+            lines.append(f"- {row['alarm_name']}  changes={row['change_count']}  url={safe_url(row['url'])}")
         lines.append("")
 
     if not errored.empty:
         lines.append("ERROR")
         for _, row in errored.iterrows():
-            lines.append(
-                f"- {row['alarm_name']}  error={row['change_count']}  url={safe_url(row['url'])}"
-            )
+            lines.append(f"- {row['alarm_name']}  error={row['change_count']}  url={safe_url(row['url'])}")
         lines.append("")
 
     if not df_diff_archive_run.empty and not changed.empty:
@@ -295,7 +269,6 @@ def normalize_content(raw_text):
     lines = [l.strip() for l in soup.get_text("\n").splitlines() if l.strip()]
     return "\n".join(lines)
 
-
 def diff_to_rows(before, after, max_field_len=4000):
     rows = []
     before_lines = (before or "").splitlines()
@@ -315,19 +288,13 @@ def diff_to_rows(before, after, max_field_len=4000):
             before_buf = text
         elif code == "+":
             b = before_buf or ""
-            rows.append({
-                "line_no": line_no,
-                "before": b[:max_field_len],
-                "after": text[:max_field_len],
-            })
+            rows.append({"line_no": line_no, "before": b[:max_field_len], "after": text[:max_field_len]})
             before_buf = None
 
     return rows
 
-
 def archive_url(url: str) -> str:
     return "https://web.archive.org/web/0/" + url
-
 
 def fetch_text(url):
     resp = session.get(url, timeout=TIMEOUT)
@@ -386,45 +353,36 @@ for alarm, url in URLS.items():
                 changes = []
 
         df_snapshot = pd.concat(
-            [
-                df_snapshot,
-                pd.DataFrame([{
-                    "run_time": run_time_str,
-                    "alarm_name": alarm,
-                    "url": url,
-                    "content": str(current_norm),
-                }]),
-            ],
+            [df_snapshot, pd.DataFrame([{
+                "run_time": run_time_str,
+                "alarm_name": alarm,
+                "url": url,
+                "content": str(current_norm),
+            }])],
             ignore_index=True,
         )
 
         df_summary = pd.concat(
-            [
-                df_summary,
-                pd.DataFrame([{
-                    "run_time": run_time_str,
-                    "alarm_name": alarm,
-                    "url": url,
-                    "change_flag": change_flag,
-                    "change_count": change_count,
-                }]),
-            ],
+            [df_summary, pd.DataFrame([{
+                "run_time": run_time_str,
+                "alarm_name": alarm,
+                "url": url,
+                "change_flag": change_flag,
+                "change_count": change_count,
+            }])],
             ignore_index=True,
         )
 
         if changes:
             df_diff_archive = pd.concat(
-                [
-                    df_diff_archive,
-                    pd.DataFrame([{
-                        "run_time": run_time_str,
-                        "alarm_name": alarm,
-                        "url": url,
-                        "line_no": None,
-                        "before": "\n".join(c["before"] for c in changes),
-                        "after": "\n".join(c["after"] for c in changes),
-                    }]),
-                ],
+                [df_diff_archive, pd.DataFrame([{
+                    "run_time": run_time_str,
+                    "alarm_name": alarm,
+                    "url": url,
+                    "line_no": None,
+                    "before": "\n".join(c["before"] for c in changes),
+                    "after": "\n".join(c["after"] for c in changes),
+                }])],
                 ignore_index=True,
             )
 
@@ -432,16 +390,13 @@ for alarm, url in URLS.items():
 
     except Exception as e:
         df_summary = pd.concat(
-            [
-                df_summary,
-                pd.DataFrame([{
-                    "run_time": run_time_str,
-                    "alarm_name": alarm,
-                    "url": url,
-                    "change_flag": "ERROR",
-                    "change_count": str(e),
-                }]),
-            ],
+            [df_summary, pd.DataFrame([{
+                "run_time": run_time_str,
+                "alarm_name": alarm,
+                "url": url,
+                "change_flag": "ERROR",
+                "change_count": str(e),
+            }])],
             ignore_index=True,
         )
         print(f"{alarm}: ERROR {e}")
@@ -464,16 +419,22 @@ df_diff_archive_run = df_diff_archive[df_diff_archive["run_time"] == run_time_st
 has_changed = (df_summary_run["change_flag"] == "CHANGED").any()
 has_error = (df_summary_run["change_flag"] == "ERROR").any()
 
+# Always post a one-line run summary to ALL channel
+send_discord_webhook(DISCORD_WEBHOOK_URL_ALL, build_discord_all_message(df_summary_run, run_time_str))
+
+# Post changed details
+if has_changed:
+    send_discord_webhook(DISCORD_WEBHOOK_URL_CHANGED, build_discord_changed_message(df_summary_run, run_time_str))
+
+# Post error details
+if has_error:
+    send_discord_webhook(DISCORD_WEBHOOK_URL_ERROR, build_discord_error_message(df_summary_run, run_time_str))
+
+# Email only when changed or error (your existing logic)
 if has_changed or has_error:
     subject = f"URL Monitor Alert {run_time_str}"
-
-    # Email
     body = build_email_body(df_summary_run, df_diff_archive_run, run_time_str)
     send_sendgrid_email(subject, body)
-
-    # Discord
-    discord_msg = build_discord_message(df_summary_run, df_diff_archive_run, run_time_str)
-    send_discord_webhook(discord_msg)
 else:
-    print("No changes, no alerts")
+    print("No changes, no email")
 
