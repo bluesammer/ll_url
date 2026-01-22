@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[9]:
+# In[12]:
 
 
 import os
 import json
 import difflib
+import base64
 from datetime import datetime
 from io import StringIO
 
@@ -70,7 +71,7 @@ def load_urls_from_google_sheet(csv_url: str) -> dict:
 
     ct = (r.headers.get("Content-Type") or "").lower()
     if "text/html" in ct:
-        raise ValueError("Google Sheet did not return CSV. Set sharing to Anyone with the link, Viewer.")
+        raise ValueError("Google Sheet returned HTML. Set sharing to Anyone with the link, Viewer.")
 
     df = pd.read_csv(StringIO(r.text))
 
@@ -106,7 +107,7 @@ DISCORD_WEBHOOK_URL_CHANGED = os.getenv("DISCORD_WEBHOOK_URL_CHANGED", "").strip
 DISCORD_WEBHOOK_URL_ERROR = os.getenv("DISCORD_WEBHOOK_URL_ERROR", "").strip()
 
 def send_discord_webhook(webhook_url: str, message: str) -> bool:
-    if not webhook_url:
+    if webhook_url == "":
         print("Discord skipped. Webhook missing.")
         return False
 
@@ -153,20 +154,47 @@ def build_discord_error_message(df_summary_run, run_time_str):
     return "\n".join(lines)
 
 # --------------------------------------
-# EMAIL ALERTS (SendGrid)
+# EMAIL ALERTS (SendGrid) with CSV attachment
 # --------------------------------------
 
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 ALERT_FROM_EMAIL = os.getenv("ALERT_FROM_EMAIL", "").strip()
 
 ALERT_TO_EMAILS_RAW = os.getenv("ALERT_TO_EMAILS", "").strip()
-if not ALERT_TO_EMAILS_RAW:
+if ALERT_TO_EMAILS_RAW == "":
     ALERT_TO_EMAILS_RAW = os.getenv("ALERT_TO_EMAIL", "").strip()
 
 ALERT_TO_EMAILS = [e.strip() for e in ALERT_TO_EMAILS_RAW.split(",") if e.strip()]
 
-def send_sendgrid_email(subject, body_text):
-    if not SENDGRID_API_KEY or not ALERT_FROM_EMAIL or not ALERT_TO_EMAILS:
+def _build_sendgrid_attachments(paths):
+    items = []
+    if paths is None:
+        return items
+
+    for path in paths:
+        if path is None:
+            continue
+        path = str(path).strip()
+        if path == "":
+            continue
+        if os.path.isfile(path) is False:
+            print("Attachment missing:", path)
+            continue
+
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        items.append({
+            "content": b64,
+            "type": "text/csv",
+            "filename": os.path.basename(path),
+            "disposition": "attachment",
+        })
+
+    return items
+
+def send_sendgrid_email(subject, body_text, attach_paths=None):
+    if SENDGRID_API_KEY == "" or ALERT_FROM_EMAIL == "" or len(ALERT_TO_EMAILS) == 0:
         print("Email skipped. Missing SendGrid configuration.")
         return False
 
@@ -176,6 +204,10 @@ def send_sendgrid_email(subject, body_text):
         "subject": subject,
         "content": [{"type": "text/plain", "value": body_text}],
     }
+
+    attachments = _build_sendgrid_attachments(attach_paths)
+    if len(attachments) > 0:
+        payload["attachments"] = attachments
 
     try:
         r = requests.post(
@@ -211,19 +243,28 @@ def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
     lines.append(f"Errored alarms: {len(errored)}")
     lines.append("")
 
-    if not changed.empty:
+    # Include df_summary_run as text so your boss sees live output inside the email
+    lines.append("SUMMARY TABLE")
+    try:
+        df_show = df_summary_run[["alarm_name", "change_flag", "change_count", "url"]].copy()
+        lines.append(df_show.to_string(index=False, max_colwidth=140))
+    except Exception as e:
+        lines.append(f"Summary table render error: {e}")
+    lines.append("")
+
+    if changed.empty is False:
         lines.append("CHANGED")
         for _, row in changed.iterrows():
             lines.append(f"- {row['alarm_name']}  changes={row['change_count']}  url={safe_url(row['url'])}")
         lines.append("")
 
-    if not errored.empty:
+    if errored.empty is False:
         lines.append("ERROR")
         for _, row in errored.iterrows():
             lines.append(f"- {row['alarm_name']}  error={row['change_count']}  url={safe_url(row['url'])}")
         lines.append("")
 
-    if not df_diff_archive_run.empty and not changed.empty:
+    if df_diff_archive_run.empty is False and changed.empty is False:
         lines.append("DIFF EXCERPTS (first 25 rows per alarm)")
         for alarm in changed["alarm_name"].tolist():
             sub = df_diff_archive_run[df_diff_archive_run["alarm_name"] == alarm].sort_values("line_no").head(25)
@@ -323,9 +364,6 @@ def archive_url(url: str) -> str:
 def fetch_text(url):
     resp = session.get(url, timeout=TIMEOUT)
 
-    if resp is None:
-        raise RuntimeError("No response")
-
     if resp.status_code == 403:
         print("403 blocked. Trying archive:", url)
         ar = requests.get(archive_url(url), headers=DEFAULT_HEADERS, timeout=TIMEOUT)
@@ -364,7 +402,7 @@ for alarm, url in URLS.items():
 
         prev_row = df_snapshot[df_snapshot["alarm_name"] == alarm].tail(1)
         prev_text = None
-        if not prev_row.empty:
+        if prev_row.empty is False:
             prev_text = prev_row["content"].values[0]
 
         if prev_text is None:
@@ -402,7 +440,7 @@ for alarm, url in URLS.items():
             ignore_index=True,
         )
 
-        if changes:
+        if len(changes) > 0:
             df_diff_archive = pd.concat(
                 [df_diff_archive, pd.DataFrame([{
                     "run_time": run_time_str,
@@ -442,7 +480,7 @@ df_summary.to_csv(SUMMARY_CSV, index=False)
 df_diff_archive.to_csv(DIFF_ARCHIVE_CSV, index=False)
 
 # --------------------------------------
-# SEND ALERTS (Email + Discord)
+# SEND ALERTS (Discord + Email)
 # --------------------------------------
 
 df_summary_run = df_summary[df_summary["run_time"] == run_time_str]
@@ -459,22 +497,57 @@ if has_changed:
 if has_error:
     send_discord_webhook(DISCORD_WEBHOOK_URL_ERROR, build_discord_error_message(df_summary_run, run_time_str))
 
-if has_changed or has_error:
-    subject = f"URL Monitor Alert {run_time_str}"
-    body = build_email_body(df_summary_run, df_diff_archive_run, run_time_str)
-    send_sendgrid_email(subject, body)
-else:
-    print("No changes, no email")
+# Always email on every run for demo visibility
+subject = f"URL Monitor Run {run_time_str}"
+body = build_email_body(df_summary_run, df_diff_archive_run, run_time_str)
+
+# Attach df_summary CSV, plus diff archive CSV when it exists
+attach_list = [SUMMARY_CSV]
+if os.path.isfile(DIFF_ARCHIVE_CSV):
+    attach_list.append(DIFF_ARCHIVE_CSV)
+
+send_sendgrid_email(subject, body, attach_paths=attach_list)
+print("Email attempted for every run")
 
 
 # In[10]:
 
 
-df_summary
+#df_summary
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
 
 
 # In[11]:
 
 
-df_diff_archive
+
 
