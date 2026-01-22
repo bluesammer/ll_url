@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[3]:
+# In[9]:
 
 
 import os
 import json
 import difflib
 from datetime import datetime
+from io import StringIO
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -18,23 +19,9 @@ import pandas as pd
 # CONFIG
 # --------------------------------------
 
-URLS = {
-    "COMPET_DYC": "https://www.dynacare.ca/",
-    # "COMPET_AHL": "https://alphalabs.ca/",
-    "COMPET_MOW": "https://medlabsofwindsor.com/",
-    "COMPET_MHL": "https://www.mhlab.ca/",
-    "COMPET_SWH": "https://switchhealth.ca/",
-    "COMPET_BIO": "https://bio-test.ca/",
-    # "COMPET_LL": "https://www.lifelabs.com/",
-    "SOB": "https://www.ontario.ca/page/ohip-schedule-benefits-and-fees",
-    "NEWS_1": "https://news.ontario.ca/moh/en",
-    "NEWS_2": "https://gov.on.ca",
-    "NEWS_3": "https://www.ontario.ca/document/ohip-infobulletins-2025",
-    "NEWS_3_2026": "https://www.ontario.ca/document/ohip-infobulletins-2026",
-    "NEWS_4": "https://www.regulatoryregistry.gov.on.ca/",
-    "NEWS_5": "https://www.ontario.ca/laws/regulation/900552",
-    "NEWS_6": "https://www.ontario.ca/page/ontarios-primary-care-action-plan-1-year-progress-update",
-}
+SHEET_ID = "1aXZ06m5r9voN0tU9Ip6VUtr7BYiYaqTZuwZsUYeMKvo"
+SHEET_NAME = "LIVe"
+SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={SHEET_NAME}"
 
 SNAPSHOT_CSV = "snapshot_data.csv"
 SUMMARY_CSV = "Alarm_url_changes.csv"
@@ -57,8 +44,6 @@ DEFAULT_HEADERS = {
 
 os.makedirs(os.path.dirname(SNAPSHOT_CSV) or ".", exist_ok=True)
 
-print(f"Loaded {len(URLS)} URLs")
-
 # --------------------------------------
 # URL GUARD
 # --------------------------------------
@@ -74,6 +59,41 @@ def validate_urls(urls: dict):
         for name, url in bad:
             print(" -", name, url)
         raise SystemExit(2)
+
+# --------------------------------------
+# LOAD URLS FROM PUBLIC GOOGLE SHEET
+# --------------------------------------
+
+def load_urls_from_google_sheet(csv_url: str) -> dict:
+    r = requests.get(csv_url, timeout=30)
+    r.raise_for_status()
+
+    ct = (r.headers.get("Content-Type") or "").lower()
+    if "text/html" in ct:
+        raise ValueError("Google Sheet did not return CSV. Set sharing to Anyone with the link, Viewer.")
+
+    df = pd.read_csv(StringIO(r.text))
+
+    df.columns = [str(c).strip() for c in df.columns]
+    required = {"Alarm", "url"}
+    missing = [c for c in required if c not in set(df.columns)]
+    if missing:
+        raise ValueError(f"Sheet missing columns: {missing}. Needed: Alarm, url")
+
+    df["Alarm"] = df["Alarm"].astype(str).str.strip()
+    df["url"] = df["url"].astype(str).str.strip()
+
+    df = df[(df["Alarm"] != "") & (df["url"] != "")]
+    df = df.drop_duplicates(subset=["Alarm"], keep="last")
+
+    urls = dict(zip(df["Alarm"].tolist(), df["url"].tolist()))
+    if len(urls) == 0:
+        raise ValueError("Sheet returned zero rows after cleanup")
+
+    return urls
+
+URLS = load_urls_from_google_sheet(SHEET_CSV_URL)
+print(f"Loaded {len(URLS)} URLs from Google Sheet tab {SHEET_NAME}")
 
 validate_urls(URLS)
 
@@ -204,23 +224,20 @@ def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
         lines.append("")
 
     if not df_diff_archive_run.empty and not changed.empty:
-        lines.append("DIFF EXCERPTS")
+        lines.append("DIFF EXCERPTS (first 25 rows per alarm)")
         for alarm in changed["alarm_name"].tolist():
-            sub = df_diff_archive_run[df_diff_archive_run["alarm_name"] == alarm].tail(1)
+            sub = df_diff_archive_run[df_diff_archive_run["alarm_name"] == alarm].sort_values("line_no").head(25)
             if sub.empty:
                 continue
 
-            before_txt = str(sub["before"].values[0])[:1500]
-            after_txt = str(sub["after"].values[0])[:1500]
-
+            lines.append("")
             lines.append(f"Alarm: {alarm}")
-            lines.append("Before (excerpt):")
-            lines.append(before_txt)
-            lines.append("")
-            lines.append("After (excerpt):")
-            lines.append(after_txt)
-            lines.append("")
-            lines.append("----------------------------------------")
+            for _, r in sub.iterrows():
+                b = str(r["before"])[:500]
+                a = str(r["after"])[:500]
+                lines.append(f"- line={r['line_no']} before_len={len(b)} after_len={len(a)}")
+                lines.append(f"  before: {b}")
+                lines.append(f"  after : {a}")
 
     lines.append("")
     lines.append("Files written:")
@@ -288,7 +305,14 @@ def diff_to_rows(before, after, max_field_len=4000):
             before_buf = text
         elif code == "+":
             b = before_buf or ""
-            rows.append({"line_no": line_no, "before": b[:max_field_len], "after": text[:max_field_len]})
+            rows.append({
+                "line_no": line_no,
+                "before": b[:max_field_len],
+                "after": text[:max_field_len],
+                "before_len": len(b),
+                "after_len": len(text),
+                "delta_len": len(text) - len(b),
+            })
             before_buf = None
 
     return rows
@@ -317,7 +341,12 @@ def fetch_text(url):
 
 df_snapshot = pd.DataFrame(columns=["run_time", "alarm_name", "url", "content"])
 df_summary = pd.DataFrame(columns=["run_time", "alarm_name", "url", "change_flag", "change_count"])
-df_diff_archive = pd.DataFrame(columns=["run_time", "alarm_name", "url", "line_no", "before", "after"])
+
+df_diff_archive = pd.DataFrame(columns=[
+    "run_time", "alarm_name", "url",
+    "line_no", "before", "after",
+    "before_len", "after_len", "delta_len"
+])
 
 if os.path.isfile(SNAPSHOT_CSV):
     df_snapshot = pd.read_csv(SNAPSHOT_CSV)
@@ -379,10 +408,13 @@ for alarm, url in URLS.items():
                     "run_time": run_time_str,
                     "alarm_name": alarm,
                     "url": url,
-                    "line_no": None,
-                    "before": "\n".join(c["before"] for c in changes),
-                    "after": "\n".join(c["after"] for c in changes),
-                }])],
+                    "line_no": c["line_no"],
+                    "before": c["before"],
+                    "after": c["after"],
+                    "before_len": c["before_len"],
+                    "after_len": c["after_len"],
+                    "delta_len": c["delta_len"],
+                } for c in changes])],
                 ignore_index=True,
             )
 
@@ -419,22 +451,30 @@ df_diff_archive_run = df_diff_archive[df_diff_archive["run_time"] == run_time_st
 has_changed = (df_summary_run["change_flag"] == "CHANGED").any()
 has_error = (df_summary_run["change_flag"] == "ERROR").any()
 
-# Always post a one-line run summary to ALL channel
 send_discord_webhook(DISCORD_WEBHOOK_URL_ALL, build_discord_all_message(df_summary_run, run_time_str))
 
-# Post changed details
 if has_changed:
     send_discord_webhook(DISCORD_WEBHOOK_URL_CHANGED, build_discord_changed_message(df_summary_run, run_time_str))
 
-# Post error details
 if has_error:
     send_discord_webhook(DISCORD_WEBHOOK_URL_ERROR, build_discord_error_message(df_summary_run, run_time_str))
 
-# Email only when changed or error (your existing logic)
 if has_changed or has_error:
     subject = f"URL Monitor Alert {run_time_str}"
     body = build_email_body(df_summary_run, df_diff_archive_run, run_time_str)
     send_sendgrid_email(subject, body)
 else:
     print("No changes, no email")
+
+
+# In[10]:
+
+
+df_summary
+
+
+# In[11]:
+
+
+df_diff_archive
 
