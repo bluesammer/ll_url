@@ -304,68 +304,52 @@ def send_sendgrid_email(subject, body_text, attach_paths=None):
         print(f"SendGrid exception: {e}")
         return False
 
-def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
+def build_email_body(df_summary_run, df_diff_archive_run, run_time_str, max_rows=300):
+    # Email body shows only the diff table, matching your CSV columns
+
+    changed_alarms = df_summary_run[df_summary_run["change_flag"] == "CHANGED"]["alarm_name"].tolist()
+    if len(changed_alarms) > 0:
+        df_show = df_diff_archive_run[df_diff_archive_run["alarm_name"].isin(changed_alarms)].copy()
+    else:
+        df_show = df_diff_archive_run.copy()
+
+    cols = [
+        "run_time", "alarm_name", "url",
+        "line_no", "before", "after",
+        "before_len", "after_len", "delta_len"
+    ]
+
+    if df_show.empty:
+        return "\n".join([
+            f"Run time: {run_time_str}",
+            "",
+            "No diff rows this run.",
+            "",
+            "Files written:",
+            f"- {DIFF_ARCHIVE_CSV}",
+            f"- {SUMMARY_CSV}",
+            f"- {SNAPSHOT_CSV}",
+        ])
+
+    df_show = df_show.sort_values(["alarm_name", "line_no"]).head(max_rows)
+
+    def _clip(s, n):
+        s = "" if s is None else str(s)
+        return s[:n]
+
+    df_show["before"] = df_show["before"].apply(lambda x: _clip(x, 180))
+    df_show["after"] = df_show["after"].apply(lambda x: _clip(x, 180))
+
     lines = []
     lines.append(f"Run time: {run_time_str}")
     lines.append("")
-
-    changed = df_summary_run[df_summary_run["change_flag"] == "CHANGED"]
-    errored = df_summary_run[df_summary_run["change_flag"] == "ERROR"]
-    blocked = df_summary_run[df_summary_run["change_flag"] == "BLOCKED"]
-
-    lines.append(f"Changed alarms: {len(changed)}")
-    lines.append(f"Blocked alarms: {len(blocked)}")
-    lines.append(f"Errored alarms: {len(errored)}")
-    lines.append("")
-
-    lines.append("SUMMARY TABLE")
-    try:
-        df_show = df_summary_run[["alarm_name", "change_flag", "change_count", "url"]].copy()
-        lines.append(df_show.to_string(index=False, max_colwidth=140))
-    except Exception as e:
-        lines.append(f"Summary table render error: {e}")
-    lines.append("")
-
-    if blocked.empty is False:
-        lines.append("BLOCKED (snapshot skipped)")
-        for _, row in blocked.iterrows():
-            lines.append(f"- {row['alarm_name']}  reason={row['change_count']}  url={safe_url(row['url'])}")
-        lines.append("")
-
-    if changed.empty is False:
-        lines.append("CHANGED")
-        for _, row in changed.iterrows():
-            lines.append(f"- {row['alarm_name']}  changes={row['change_count']}  url={safe_url(row['url'])}")
-        lines.append("")
-
-    if errored.empty is False:
-        lines.append("ERROR")
-        for _, row in errored.iterrows():
-            lines.append(f"- {row['alarm_name']}  error={row['change_count']}  url={safe_url(row['url'])}")
-        lines.append("")
-
-    if df_diff_archive_run.empty is False and changed.empty is False:
-        lines.append("DIFF EXCERPTS (first 25 rows per alarm)")
-        for alarm in changed["alarm_name"].tolist():
-            sub = df_diff_archive_run[df_diff_archive_run["alarm_name"] == alarm].sort_values("line_no").head(25)
-            if sub.empty:
-                continue
-
-            lines.append("")
-            lines.append(f"Alarm: {alarm}")
-            for _, r in sub.iterrows():
-                b = str(r["before"])[:500]
-                a = str(r["after"])[:500]
-                lines.append(f"- line={r['line_no']} before_len={len(b)} after_len={len(a)}")
-                lines.append(f"  before: {b}")
-                lines.append(f"  after : {a}")
-
+    lines.append("DIFF ROWS")
+    lines.append(df_show[cols].to_string(index=False, max_colwidth=200))
     lines.append("")
     lines.append("Files written:")
-    lines.append(f"- {SUMMARY_CSV}")
     lines.append(f"- {DIFF_ARCHIVE_CSV}")
+    lines.append(f"- {SUMMARY_CSV}")
     lines.append(f"- {SNAPSHOT_CSV}")
-
     return "\n".join(lines)
 
 # --------------------------------------
@@ -398,7 +382,7 @@ session = build_session()
 def normalize_content(raw_text):
     raw_text = (raw_text or "").strip()
 
-    # JSON input
+    # JSON input normalization
     try:
         obj = json.loads(raw_text)
         if isinstance(obj, (dict, list)):
@@ -408,7 +392,6 @@ def normalize_content(raw_text):
 
     soup = BeautifulSoup(raw_text, "html.parser")
 
-    # Remove scripts/styles for cleaner text
     for tag in soup(["script", "style", "noscript"]):
         tag.extract()
 
@@ -416,10 +399,8 @@ def normalize_content(raw_text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     cleaned = "\n".join(lines)
 
-    # Strip known junk lines before diff
     cleaned = strip_noise_lines(cleaned)
 
-    # Collapse extra whitespace lines
     cleaned_lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
     return "\n".join(cleaned_lines)
 
@@ -496,7 +477,7 @@ for alarm, url in URLS.items():
         raw_text = fetch_text(url)
         current_norm = normalize_content(raw_text)
 
-        # Block/login gate handling: skip diff + skip snapshot update
+        # If blocked, skip snapshot and diff
         if is_blocked_page(current_norm):
             df_summary = pd.concat(
                 [df_summary, pd.DataFrame([{
@@ -608,12 +589,16 @@ if has_changed:
 if has_issue:
     send_discord_webhook(DISCORD_WEBHOOK_URL_ERROR, build_discord_error_message(df_summary_run, run_time_str))
 
+# Email body: only the diff rows table
 subject = f"URL Monitor Run {run_time_str}"
 body = build_email_body(df_summary_run, df_diff_archive_run, run_time_str)
 
-attach_list = [SUMMARY_CSV]
+# Attach CSV files too
+attach_list = []
 if os.path.isfile(DIFF_ARCHIVE_CSV):
     attach_list.append(DIFF_ARCHIVE_CSV)
+if os.path.isfile(SUMMARY_CSV):
+    attach_list.append(SUMMARY_CSV)
 
 send_sendgrid_email(subject, body, attach_paths=attach_list)
 print("Email attempted for every run")
