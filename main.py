@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[12]:
+# In[17]:
 
 
 import os
 import json
 import difflib
 import base64
+import re
 from datetime import datetime
 from io import StringIO
 
@@ -44,6 +45,69 @@ DEFAULT_HEADERS = {
 }
 
 os.makedirs(os.path.dirname(SNAPSHOT_CSV) or ".", exist_ok=True)
+
+# --------------------------------------
+# BLOCK + NOISE FILTERS
+# --------------------------------------
+
+BLOCK_PAGE_PATTERNS = [
+    r"\blog in to continue\b",
+    r"\bfor full account access\b",
+    r"\bplease log in\b",
+    r"\baccess denied\b",
+    r"\brequest blocked\b",
+    r"\bforbidden\b",
+    r"\bverify you are human\b",
+    r"\bcaptcha\b",
+    r"\bchecking your browser\b",
+    r"\bjust a moment\b",
+    r"\benable cookies\b",
+    r"\bunusual traffic\b",
+    r"\btemporarily unavailable\b",
+]
+
+NOISE_LINE_PATTERNS = [
+    r"\blog in to continue\b",
+    r"\bplease\b",
+    r"\blog in\b",
+    r"\bfor full account access\b",
+    r"\bcookie\b",
+    r"\baccept all\b",
+    r"\baccept cookies\b",
+    r"\bmanage cookies\b",
+    r"\bprivacy policy\b",
+    r"\bterms of use\b",
+    r"\bskip to content\b",
+    r"\bjavascript\b",
+    r"\byour browser\b",
+    r"\bsubscribe\b",
+    r"\bsign in\b",
+    r"\bregister\b",
+]
+
+_BLOCK_RE = re.compile("|".join(BLOCK_PAGE_PATTERNS), flags=re.IGNORECASE)
+_NOISE_RE = re.compile("|".join(NOISE_LINE_PATTERNS), flags=re.IGNORECASE)
+
+def is_blocked_page(text: str) -> bool:
+    t = (text or "").strip()
+    if t == "":
+        return True
+    if _BLOCK_RE.search(t):
+        return True
+    return False
+
+def strip_noise_lines(text: str) -> str:
+    lines = [l.strip() for l in (text or "").splitlines()]
+    keep = []
+    for l in lines:
+        if l == "":
+            continue
+        if len(l) <= 1:
+            continue
+        if _NOISE_RE.search(l):
+            continue
+        keep.append(l)
+    return "\n".join(keep)
 
 # --------------------------------------
 # URL GUARD
@@ -131,12 +195,15 @@ def safe_url(u: str) -> str:
 def build_discord_all_message(df_summary_run, run_time_str):
     changed = df_summary_run[df_summary_run["change_flag"] == "CHANGED"]
     errored = df_summary_run[df_summary_run["change_flag"] == "ERROR"]
+    blocked = df_summary_run[df_summary_run["change_flag"] == "BLOCKED"]
     nochange = df_summary_run[df_summary_run["change_flag"] == "NO_CHANGE"]
     first = df_summary_run[df_summary_run["change_flag"] == "FIRST_RUN"]
 
     lines = []
     lines.append(f"RUN {run_time_str}")
-    lines.append(f"Changed {len(changed)} | Errors {len(errored)} | No change {len(nochange)} | First {len(first)}")
+    lines.append(
+        f"Changed {len(changed)} | Errors {len(errored)} | Blocked {len(blocked)} | No change {len(nochange)} | First {len(first)}"
+    )
     return "\n".join(lines)
 
 def build_discord_changed_message(df_summary_run, run_time_str):
@@ -148,9 +215,15 @@ def build_discord_changed_message(df_summary_run, run_time_str):
 
 def build_discord_error_message(df_summary_run, run_time_str):
     errored = df_summary_run[df_summary_run["change_flag"] == "ERROR"]
-    lines = [f"ERROR {run_time_str}", ""]
+    blocked = df_summary_run[df_summary_run["change_flag"] == "BLOCKED"]
+    lines = [f"ISSUES {run_time_str}", ""]
+
+    for _, row in blocked.iterrows():
+        lines.append(f"- {row['alarm_name']} blocked={row['change_count']} url={safe_url(row['url'])}")
+
     for _, row in errored.iterrows():
         lines.append(f"- {row['alarm_name']} error={row['change_count']} url={safe_url(row['url'])}")
+
     return "\n".join(lines)
 
 # --------------------------------------
@@ -238,12 +311,13 @@ def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
 
     changed = df_summary_run[df_summary_run["change_flag"] == "CHANGED"]
     errored = df_summary_run[df_summary_run["change_flag"] == "ERROR"]
+    blocked = df_summary_run[df_summary_run["change_flag"] == "BLOCKED"]
 
     lines.append(f"Changed alarms: {len(changed)}")
+    lines.append(f"Blocked alarms: {len(blocked)}")
     lines.append(f"Errored alarms: {len(errored)}")
     lines.append("")
 
-    # Include df_summary_run as text so your boss sees live output inside the email
     lines.append("SUMMARY TABLE")
     try:
         df_show = df_summary_run[["alarm_name", "change_flag", "change_count", "url"]].copy()
@@ -251,6 +325,12 @@ def build_email_body(df_summary_run, df_diff_archive_run, run_time_str):
     except Exception as e:
         lines.append(f"Summary table render error: {e}")
     lines.append("")
+
+    if blocked.empty is False:
+        lines.append("BLOCKED (snapshot skipped)")
+        for _, row in blocked.iterrows():
+            lines.append(f"- {row['alarm_name']}  reason={row['change_count']}  url={safe_url(row['url'])}")
+        lines.append("")
 
     if changed.empty is False:
         lines.append("CHANGED")
@@ -318,14 +398,30 @@ session = build_session()
 def normalize_content(raw_text):
     raw_text = (raw_text or "").strip()
 
+    # JSON input
     try:
-        return json.loads(raw_text)
+        obj = json.loads(raw_text)
+        if isinstance(obj, (dict, list)):
+            raw_text = json.dumps(obj, ensure_ascii=False, sort_keys=True)
     except Exception:
         pass
 
     soup = BeautifulSoup(raw_text, "html.parser")
-    lines = [l.strip() for l in soup.get_text("\n").splitlines() if l.strip()]
-    return "\n".join(lines)
+
+    # Remove scripts/styles for cleaner text
+    for tag in soup(["script", "style", "noscript"]):
+        tag.extract()
+
+    text = soup.get_text("\n")
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    cleaned = "\n".join(lines)
+
+    # Strip known junk lines before diff
+    cleaned = strip_noise_lines(cleaned)
+
+    # Collapse extra whitespace lines
+    cleaned_lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
+    return "\n".join(cleaned_lines)
 
 def diff_to_rows(before, after, max_field_len=4000):
     rows = []
@@ -399,6 +495,21 @@ for alarm, url in URLS.items():
     try:
         raw_text = fetch_text(url)
         current_norm = normalize_content(raw_text)
+
+        # Block/login gate handling: skip diff + skip snapshot update
+        if is_blocked_page(current_norm):
+            df_summary = pd.concat(
+                [df_summary, pd.DataFrame([{
+                    "run_time": run_time_str,
+                    "alarm_name": alarm,
+                    "url": url,
+                    "change_flag": "BLOCKED",
+                    "change_count": "LOGIN_OR_BOT_GATE",
+                }])],
+                ignore_index=True,
+            )
+            print(f"{alarm}: BLOCKED (snapshot skipped)")
+            continue
 
         prev_row = df_snapshot[df_snapshot["alarm_name"] == alarm].tail(1)
         prev_text = None
@@ -487,21 +598,19 @@ df_summary_run = df_summary[df_summary["run_time"] == run_time_str]
 df_diff_archive_run = df_diff_archive[df_diff_archive["run_time"] == run_time_str]
 
 has_changed = (df_summary_run["change_flag"] == "CHANGED").any()
-has_error = (df_summary_run["change_flag"] == "ERROR").any()
+has_issue = ((df_summary_run["change_flag"] == "ERROR") | (df_summary_run["change_flag"] == "BLOCKED")).any()
 
 send_discord_webhook(DISCORD_WEBHOOK_URL_ALL, build_discord_all_message(df_summary_run, run_time_str))
 
 if has_changed:
     send_discord_webhook(DISCORD_WEBHOOK_URL_CHANGED, build_discord_changed_message(df_summary_run, run_time_str))
 
-if has_error:
+if has_issue:
     send_discord_webhook(DISCORD_WEBHOOK_URL_ERROR, build_discord_error_message(df_summary_run, run_time_str))
 
-# Always email on every run for demo visibility
 subject = f"URL Monitor Run {run_time_str}"
 body = build_email_body(df_summary_run, df_diff_archive_run, run_time_str)
 
-# Attach df_summary CSV, plus diff archive CSV when it exists
 attach_list = [SUMMARY_CSV]
 if os.path.isfile(DIFF_ARCHIVE_CSV):
     attach_list.append(DIFF_ARCHIVE_CSV)
@@ -510,10 +619,10 @@ send_sendgrid_email(subject, body, attach_paths=attach_list)
 print("Email attempted for every run")
 
 
-# In[10]:
+# In[16]:
 
 
-#df_summary
+df_snapshot
 
 
 # In[ ]:
